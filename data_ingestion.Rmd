@@ -1,0 +1,262 @@
+---
+title: "data_ingestion"
+author: "Gabriella Montalvo"
+date: "2025-05-09"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(caret)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(jsonlite)
+library(ggrepel)
+library(MASS)
+library(lubridate)
+library(rpart)
+library(glmnet)
+library(randomForest)
+library(zoo)
+library(rpart.plot)
+```
+
+# Final Project: Predicting Disciplinary Action for Complaints against NYPD Officers
+### Analyzing Differences Between Model Performances in Disciplinary Action Prediction
+
+## Data Ingestion and Basic Quality Checks: Getting to Know the Data
+
+## Step 1: Problem Statement and Reading in the Data
+
+The following code is an exercise in getting acquainted with the data at hand: four datasets created by the NYC Civilian Complaint Review Board, which logs complaints and facilitates disciplinary proceedings against NYPD officers with allegations of civilian misconduct. All of this data is available via the CCRB's "Data Transparency Initiative," which can be found at https://www.nyc.gov/site/ccrb/policy/data-transparency-initiative.page. 
+
+With a goal of predicting disciplinary action for complaints against NYPD officers, I am merging these four sets to construct a larger frame of reference for my model to pull insights from, one which includes not only the specifics of misconduct incidents and corresponding disciplinary action, but also officer demographics such as race, age, and ranking. 
+
+> Reading in the data
+
+```{r, echo = TRUE}
+
+allegations <- read.csv('/Users/gabbym/Desktop/Applied Machine Learning/Civilian_Complaint_Review_Board__Allegations_Against_Police_Officers_20250310.csv')
+
+head(allegations)
+
+complaints <- read.csv('/Users/gabbym/Desktop/Applied Machine Learning/Civilian_Complaint_Review_Board__Complaints_Against_Police_Officers_20250310.csv')
+
+head(complaints)
+
+penalties <- read.csv('/Users/gabbym/Desktop/Applied Machine Learning/Civilian_Complaint_Review_Board__Penalties_20250310.csv')
+
+head(penalties)
+
+officers <- read.csv('/Users/gabbym/Desktop/Applied Machine Learning/Civilian_Complaint_Review_Board__Police_Officers_20250310.csv', stringsAsFactors = FALSE)
+
+head(officers)
+
+```
+
+## Step 2: Data pre-processing 
+
+> Initial merge/clean
+
+```{r, echo = TRUE}
+
+# merging complaints df with allegations df by "Complaint.Id"
+complaints_allegations <- merge(complaints, allegations, by = "Complaint.Id", all.x = TRUE)
+
+# merging with penalties df on "Complaint.Id"
+cap <- merge(complaints_allegations, penalties, by = "Complaint.Id")
+
+# cleaning cap
+  
+## remove duplicates
+cap <- cap %>% distinct()
+officers <- officers %>% distinct()
+
+## match column names
+colnames(cap) <- gsub("\\.", "_", colnames(cap))  # replace dots with underscores
+colnames(officers) <- gsub("\\.", "_", colnames(officers))
+
+## convert dates to date format
+date_cols <- c("As_Of_Date_x", "CCRB_Received_Date", "Close_Date", "As_Of_Date_y")
+cap[date_cols] <- lapply(cap[date_cols], as.Date, format="%m/%d/%Y")
+
+## missing values
+cap[cap == ""] <- NA
+
+## redundant columns
+cap <- subset(cap, select = -c(As_Of_Date_y, Tax_ID_y, As_Of_Date_x))
+
+## merge together
+full <- cap %>%
+  left_join(officers, by = c("Tax_ID_x" = "Tax_ID"))
+
+```
+
+> Full merge
+
+```{r, echo = TRUE}
+
+# clean up MERGED dataset
+
+## remove duplicates (Complaint_Id, Tax_ID_x, Allegation_Record_Identity)
+full_clean <- full %>%
+  distinct(Complaint_Id, Tax_ID_x, Allegation_Record_Identity, .keep_all = TRUE)
+
+## drop redundant columns
+full_clean <- subset(full_clean, select = -c(As_Of_Date.x, As_Of_Date.y))
+
+## standardize column names
+colnames(full_clean) <- gsub(" ", "_", colnames(full_clean))  # replace spaces with underscores
+colnames(full_clean) <- gsub("__+", "_", colnames(full_clean)) # remove double underscores
+
+## convert date columns to Date format
+date_cols2 <- c("Last_Reported_Active_Date", "Non_APU_NYPD_Penalty_Report_Date", "APU_Closing_Date")
+full_clean[date_cols2] <- lapply(full_clean[date_cols2], as.Date, format="%m/%d/%Y")
+
+## missing values -> NA
+full_clean[full_clean == ""] <- NA
+
+## categorical variables to factors
+factor_cols <- c("Borough_Of_Incident_Occurrence", "Location_Type_Of_Incident", "Outcome_Of_Police_Encounter",
+                 "Officer_Rank_At_Incident", "Officer_Gender", "Officer_Race", "FADO_Type", "Allegation",
+                 "CCRB_Allegation_Disposition", "NYPD_Allegation_Disposition", "Investigator_Recommendation")
+
+full_clean <- full_clean %>%
+  mutate(across(all_of(factor_cols), as.factor))
+
+# reorder columns for readability
+full_clean <- full_clean %>%
+  arrange(Complaint_Id, Incident_Date, CCRB_Received_Date, Close_Date, Borough_Of_Incident_Occurrence,
+         Precinct_Of_Incident_Occurrence, Location_Type_Of_Incident, Reason_for_Police_Contact,
+         Outcome_Of_Police_Encounter, Allegation, FADO_Type, CCRB_Allegation_Disposition, 
+         NYPD_Allegation_Disposition, Tax_ID_x, Officer_First_Name, Officer_Last_Name, Officer_Race, 
+         Officer_Gender, Officer_Rank_At_Incident, Current_Rank, Active_Per_Last_Reported_Status)
+
+
+head(full_clean)
+
+# indexing dataset to focus on years of interest 
+
+cutoff_date <- Sys.Date() - years(10)
+ccrb10 <- full_clean %>% filter(Incident_Date >= cutoff_date)
+
+```
+
+For the purposes of this project, I've narrowed the range of years to 2015-2025. This way, I can identify disciplinary action for officers who are likely still in the service. 
+
+> Approaching missing values
+
+With advice from Wayne, my goal is to remove as few NAs as possible. I understand that data may be missing/obfuscated with intention when input by the NYPD. 
+
+I narrow my dataframe to a set of features that excludes CCRB/APU decisions as our target variable is NYPD disciplinary outcomes. In all honesty, I am searching for where and how demographic factors (both of victims and NYPD perpetrators) impact disciplinary action. 
+
+```{r, echo = TRUE}
+
+# finding which columns are NA heavy with colSums(is.na(ccrb10)), removing them for pilot
+
+colSums(is.na(ccrb10))
+
+ccrb101 <- subset(ccrb10, select = -c(Victim_Alleged_Victim_Race_Ethnicity, Non_APU_NYPD_Penalty_Report_Date, APU_Plea_Agreed_Penalty, APU_Closing_Date, APU_Trial_Commissioner_Recommended_Penalty, NYPD_Allegation_Disposition, Board_Discipline_Recommendation, APU_Case_Status, CCRB_Received_Date, Close_Date, BWC_Evidence, Video_Evidence, Officer_Command_At_Incident, Allegation_Record_Identity, Current_Rank_Abbreviation, Current_Command, Shield_No)) # removing Ethnicity because too many NAs, overlaps with Race almost completely
+ 
+ ## slimmed df down to 34 (potential) features
+
+# interpreting NAs in Officer Penalty to mean no penalty
+ccrb101$NYPD_Officer_Penalty[is.na(ccrb101$NYPD_Officer_Penalty)] <- "No penalty"
+
+# checking more NAs with colSums(is.na(ccrb101)), filling NAs in gender, race, and age categories + Reason_For_Police_Contact 
+
+## gender 
+ccrb101$Victim_Alleged_Victim_Gender[is.na(ccrb101$Victim_Alleged_Victim_Gender)] <- "Missing"
+
+## race 
+ccrb101$Victim_Alleged_Victim_Race_Legacy_[is.na(ccrb101$Victim_Alleged_Victim_Race_Legacy_)] <- "Missing"
+
+## age range 
+ccrb101$Victim_Alleged_Victim_Age_Range_At_Incident[is.na(ccrb101$Victim_Alleged_Victim_Age_Range_At_Incident)] <- "Missing"
+
+## reason for police contact 
+ccrb101$Reason_for_Police_Contact[is.na(ccrb101$Reason_for_Police_Contact)] <- "Missing"
+
+# using values from neighboring rows to fill NAs in borough, precinct, location type, hour, date, and rank
+ccrb101$Borough_Of_Incident_Occurrence <- na.locf(ccrb101$Borough_Of_Incident_Occurrence)
+ccrb101$Precinct_Of_Incident_Occurrence <- na.locf(ccrb101$Precinct_Of_Incident_Occurrence)
+ccrb101$Location_Type_Of_Incident <- na.locf(ccrb101$Location_Type_Of_Incident)
+ccrb101$Incident_Hour <- na.locf(ccrb101$Incident_Hour)
+ccrb101$Incident_Date <- na.locf(ccrb101$Incident_Date)
+ccrb101$Officer_Rank_At_Incident <- na.locf(ccrb101$Officer_Rank_At_Incident)
+
+```
+
+I chose to substitute NAs for "Missing" to flag potential instances of intentional data obfuscation. How could it benefit/harm an officer to omit essential demographic data like victim race, gender, or age range? Omitting information about the reason for police contact could also ease the penalty against an officer for a complaint. These "Missing" values are thus very intentional. 
+
+I chose to use neighboring values to fill some NAs in Borough, Precinct, Incident Location Type, Incident Hour, Incident Date, and Officer Rank, as most entries are grouped according to Complaint ID——this means that rows that directly above are likely part of the same complaint.
+
+Per the instructor's suggestion, I am trying to refrain from removing NAs. Before I update my missing data to NA, I want to create what will become my final dataframe, ccrb, which contains the (almost) all the features I will be examining, save those I will engineer in the next section. 
+
+```{r, echo = TRUE}
+
+# (almost) final features
+
+ccrb <- subset(ccrb101, select = c(Borough_Of_Incident_Occurrence, Location_Type_Of_Incident, Reason_for_Police_Contact, Officer_Rank_At_Incident, Officer_Days_On_Force_At_Incident, FADO_Type, Victim_Alleged_Victim_Age_Range_At_Incident, Victim_Alleged_Victim_Gender, Victim_Alleged_Victim_Race_Legacy_, Officer_Race, Officer_Gender, Total_Complaints, Precinct_Of_Incident_Occurrence, NYPD_Officer_Penalty))
+
+ccrb <- data.frame(ccrb, stringsAsFactors = FALSE)
+
+# renaming lengthy columns (victim age, race, gender) to avoid messy model outputs
+names(ccrb)[names(ccrb) == "Victim_Alleged_Victim_Race_Legacy_"] <- "Victim_Race"
+names(ccrb)[names(ccrb) == "Victim_Alleged_Victim_Age_Range_At_Incident"] <- "Victim_Age_Range"
+names(ccrb)[names(ccrb) == "Victim_Alleged_Victim_Gender"] <- "Victim_Gender"
+```
+
+For the purposes of this project, I found it most productive to use a narrow set of features to fit my decision tree, Ridge regression, and randomForest: 
+
+* **Borough_Of_Incident_Occurrence** measures which borough each complaint is filed in. 
+* **Precinct_Of_Incident_Occurrence** measures which precinct each complaint is filed in. This will be informative in relation to Incident_Date, as one can see which police captain presided over which precinct at any given time. 
+* **Location_Type_of_Incident** measures whether a recorded complaint occured on the street, in a residence, on the subway, etc. 
+* **Reason_for_Police_Contact** categorizes how the police-civilian interaction began, whether it be due to a "parking violation," a report, or an officer presuming some violation of a crime.
+* **Officer_Rank_At_Incident** measures the office of an NYPD officer at the time the complaint was filed against them. 
+* **Officer_Experience_Bin** categorizes how many years an officer has worked for the NYPD based on "Officer_Days_On_Force_At_Incident," arranging officers into buckets for every five years of experience. 
+* **FADO_Type** measures the type of allegation filed in a complaint——Force, Abuse of Authority, Discourtesy, and Offensive Language.
+* **Victim_Alleged_Victim_Age_Range_At_Incident** catalogs the age-range of the victim filing the complaint. Those filing usually self-report their age, but I cannot say with certainty if that was the practice for older entries in the dataset.
+* **Victim_Alleged_Victim_Gender** catalogs the gender of the victim filing the complaint. Those filing usually self-report their gender, but I cannot say with certainty if that was the practice for older entries in the dataset.
+* **Victim_Alleged_Victim_Race_Legacy_** catalogs the race of the victim filing the complaint. Those filing usually self-report their race, but I cannot say with certainty if that was the practice for older entries in the dataset.
+* **Officer_Race** catalogs the race of the officer whom the complaint is filed against. It has been obtained from a NYPD database of NYPD personnel demographics.
+* **Officer_Gender** catalogs the gender of the officer whom the complaint is filed against. It has been obtained from a NYPD database of NYPD personnel demographics.
+* **Total_Complaints** counts how many complaints have compiled against a specific officer in total. 
+
+Now that I've narrowed my features, I can proceed with updating my missing values to "NA," so those turning to my data can find which entries were left ambiguous by those inputting them at the CCRB/NYPD. 
+
+```{r, echo = TRUE}
+
+#colSums(is.na(ccrb))
+
+# cleaning up remaining NAs, so that na.omit() removes the least possible NAs
+ccrb$Officer_Race <- as.character(ccrb$Officer_Race)
+ccrb$Officer_Race[is.na(ccrb$Officer_Race)] <- "Missing"
+
+ccrb$Officer_Gender <- as.character(ccrb$Officer_Gender)
+ccrb$Officer_Gender[is.na(ccrb$Officer_Gender)] <- "Missing"
+
+ccrb$Officer_Race <- as.character(ccrb$Officer_Race)
+ccrb$Officer_Race[is.na(ccrb$Officer_Race)] <- "Missing"
+
+ccrb$Total_Complaints <- as.character(ccrb$Total_Complaints)
+ccrb$Total_Complaints[is.na(ccrb$Total_Complaints)] <- "NA filed"
+
+ccrb <- na.omit(ccrb)
+
+colSums(is.na(ccrb))
+
+```
+
+Now that all NAs are accounted for, we are one step closer to fitting models for prediction.
+
+Before we do that, let's take one final look at our data as it stands. 
+
+```{r, echo = TRUE}
+
+head(ccrb)
+
+```
+
+While I am not printing the entire dataframe here, I've noted a great deal of "Missing" in the Victim_Race variable. I am anticipating Victim_Race to play a large role in whether or not discipline occurs. 
