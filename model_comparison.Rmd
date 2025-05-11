@@ -1,0 +1,412 @@
+---
+title: "model_comparison"
+author: "Gabriella Montalvo"
+date: "2025-05-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(caret)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(jsonlite)
+library(ggrepel)
+library(MASS)
+library(lubridate)
+library(rpart)
+library(glmnet)
+library(randomForest)
+library(zoo)
+library(rpart.plot)
+```
+
+# Final Project: Predicting Disciplinary Action for Complaints against NYPD Officers
+### Analyzing Differences Between Model Performances in Disciplinary Action Prediction
+## Running Models and Comparing Performance  
+
+The following code includes experimentation with the classification tree and random forest as potential models for predicting disciplinary action against NYPD members accused of misconduct. From both models, we get a sense of which features bear the most influence in the disciplinary action decision. Between both models emerges a large gap. See the model comparison section to dig deeper into why the random forest model outperforms the classification tree. 
+
+> reading in the data
+
+```{r, echo = TRUE}
+
+read.csv("/Users/gabbym/Desktop/Applied Machine Learning/ccrb.csv")
+
+```
+
+### Step 1: Train-Test Split 
+
+```{r, echo = TRUE}
+
+# using caret to split the data (80% training, 20% testing)
+
+set.seed(123) # for reproducibility
+                  
+trainIndex <- createDataPartition(ccrb$Penalty_Binary, p = 0.8, list = FALSE)
+train_data <- ccrb[trainIndex, ]
+test_data <- ccrb[-trainIndex, ]
+
+#colSums(is.na(train_data))
+
+# ensuring categorical variables are all factors: 
+train_data[sapply(train_data, is.character)] <- lapply(train_data[sapply(train_data, is.character)], 
+                                       as.factor)
+test_data[sapply(test_data, is.character)] <- lapply(test_data[sapply(test_data, is.character)], as.factor)
+
+# shortening variable names to make trees more readable
+# Example renaming for clarity
+
+names(train_data) <- gsub("Precinct_Of_Incident_Occurrence", "Precinct", names(train_data))
+names(test_data) <- gsub("Precinct_Of_Incident_Occurrence", "Precinct", names(test_data))
+
+names(train_data) <- gsub("Reason_for_Police_Contact", "PoliceContact", names(train_data))
+names(test_data) <- gsub("Reason_for_Police_Contact", "PoliceContact", names(test_data))
+
+names(train_data) <- gsub("Officer_Rank_At_Incident", "Rank", names(train_data))
+names(test_data) <- gsub("Officer_Rank_At_Incident", "Rank", names(test_data))
+
+names(train_data) <- gsub("Officer_Experience_Bin", "Experience", names(train_data))
+names(test_data) <- gsub("Officer_Experience_Bin", "Experience", names(test_data))
+
+names(train_data) <- gsub("Location_Type_Of_Incident", "Location", names(train_data))
+names(test_data) <- gsub("Location_Type_Of_Incident", "Location", names(test_data))
+
+names(train_data) <- gsub("Borough_Of_Incident_Occurrence", "Borough", names(train_data))
+names(test_data) <- gsub("Borough_Of_Incident_Occurrence", "Borough", names(test_data))
+
+```
+
+### Classification Tree
+
+Given that I am predicting a qualitative response rather than a quantitative one, I am choosing to use a classification tree (rather than a regression tree, as described in the textbook). Decision trees are relatively interpretable and can intake both categorical and numerical data. I should note that they can be prone to overfitting, at times capturing more noise than true patterns in the data. 
+
+```{r, echo = TRUE}
+
+# training classification tree model 
+tree <- rpart(Penalty_Binary ~ Borough + Location + PoliceContact + Rank + Experience + FADO_Type + Victim_Age_Range + Victim_Gender + Victim_Race + Officer_Race + Officer_Gender + Total_Complaints + Precinct, data = train_data, method = "class")
+
+# plotting the tree
+rpart.plot(
+  tree,
+  under = TRUE,
+  cex = 0.5
+)
+
+printcp(tree) # display the results
+summary(tree)
+
+# make prediction
+tree_pred <- predict(tree, test_data, type = "class")
+
+#evaluate
+confusionMatrix(tree_pred, as.factor(test_data$Penalty_Binary), mode = "prec_recall")
+```
+
+My first attempt at a classification tree reveals some valuable insights. The root node is Victim_Race (whether it is "American Indian/Missing" or not), suggesting that race is highly significant in predicting whether a complaint leads to disciplinary action. It appears that if a victim's race is American Indian or Missing, the prediction is 1 (penalty) with 100% probability (as indicated by the green node). This outcome is especially interesting considering the demographic distribution of NYC, which bears larger Black, White, Hispanic, and Asian populations than indigenous population. Complaints involving indigenous Americans in New York City appear to always result in discipline--a potential artifact of small sample size. A penalty is highly likely.
+
+When Victim_Race is not indigenous or "Missing," there is low penalty likelihood. The next split occurs on Precinct (the left subtree); different precincts likely have different disciplinary culture and reporting standards. Certain precinct groupings present lower likelihoods to penalize officers: Precincts 100, 106, 109, 110, 111, 113, 122, 17, 26, 28, 32, 45, 78, 83 have a penalty rate of 27% for example. 
+
+Following the Precinct split is a split at PoliceContact, in which certain reasons for initial police contact result in a lower likelihood of penalty. If incidents of misconduct occurred when complainants/victims were aiding a case or filing previous complaints, there is a lower chance of disciplinary action. That said, there appears to be an overall low likelihood of discipline along this side of the tree. 
+
+The third major split occurs at Victim Age, where incidents with younger victims (29 and under) are less likely to result in officer penalties. 
+
+Further splits occur regionally, at the precinct level.
+
+This first iteration of a classification tree had a Kappa coefficient of 0.2209. Kappa measures the agreement between a model's predictions and actual values, with a score of 1 indicating perfect agreement and a score of 0 indicating none. A score as low as 0.22 indicates little to no agreement, and thus poor model performance. Note that this first attempt yielded a precision score of 0.68, a recall of 0.31, and an F1 score of 0.42——there is definitely room for improvement! 
+
+There is a chance we could be overfitting the data. Let's try pruning/using 10-fold cross validation to validate its generalizability.
+
+> Using cross-validation to validate generalizability (possible overfitting?)
+
+```{r, echo = TRUE}
+
+set.seed(234)
+
+# trying 10-fold CV
+train_control <- trainControl(method = "cv", number = 10)
+
+# training classification tree with CV
+cvtree <- train(as.factor(Penalty_Binary) ~ Borough + Location + PoliceContact + Rank + Experience + FADO_Type + Victim_Age_Range + Victim_Gender + Victim_Race + Officer_Race + Officer_Gender + Total_Complaints + Precinct, data = train_data, method = "rpart", trControl = train_control, tuneLength = 10)
+
+# model results
+print(cvtree)
+
+# plot tree (cv)
+#plot(cvtree$finalModel)
+#text(cvtree$finalModel, use.n = TRUE, cex = 0.7)
+
+# Cleaner and more readable plot
+rpart.plot(
+  cvtree$finalModel,             
+  type = 2,                
+  extra = 104,              
+  under = TRUE,            
+  box.palette = "GnBu",    
+  fallen.leaves = TRUE,    
+  cex = 0.5,               
+  tweak = 1.2,              
+  compress = TRUE,          
+  varlen = 12,              
+  faclen = 10              
+)
+
+
+# evaluate cross-validated (unpruned) model
+cvtree.pred <- predict(cvtree, newdata = test_data)
+confusionMatrix(cvtree.pred, as.factor(test_data$Penalty_Binary), mode = "prec_recall")
+
+```
+
+The density of this tree makes it pretty hard to read. At a cursory glance, Victim Race remains the most significant in predicting whether or not discipline occurs, this time splitting at "Missing." If the victim race is missing, the tree predicts penalty (1) with 100% certainty, likely due to sparse cases. 
+
+Where Victim Race is not missing (the left subtree), the first split occurs at gender "missing." We can continue down the tree to where gender is known. Where gender is known, the next split occurs at Precinct, with the 60th Precinct performing at a high penalty rate under these conditions. As Precinct delineation continues, another key split occurs at reason for police contact, in which incidents initiated during moving violations have higher likelihoods toward penalty, whereas instances of police misconduct at demonstrations (PoliceContact == Demonstration) have a lower likelihood of resulting in penalty. 
+
+Where Victim Race is missing (the right subtree), the first split occurs at FADO Type, where use of force by a police officer is a major path to penalty. Further precinct-specific splits occur, with the next key splits at reason for police contact and location of incident occurrence; complaints issued while already in police custody bear higher penalty likelihoods, where those issued for incidents occurring in public space (highly visible locations) also improve likelihood of penalty. Another key split occurs at Officer Rank, in which accused officers maintaining the rank of Sergeant are less likely to receive disciplinary action after alleged misconduct. 
+
+As for the confusion matrix output: a precision score of 0.60, a recall of 0.45, and an F1 score of 0.51 show minimal improvement from the first decision tree. As of right now, the model predicts no penalty (0) correctly about 60% of the time, correctly classifies actual 0s only 45% of the time, and misses a significant number of actual 0s with moderate confidence. 
+
+A Kappa of 0.2515 shows some agreement between actual and predicted values, but not substantial. Clearly, the model is still struggling.
+
+Let's try pruning this tree to find any significant improvement in prediction. 
+
+```{r, echo = TRUE}
+
+#check the best complexity parameter
+best_cp <- cvtree$bestTune
+print(best_cp)
+
+#prune the tree using the best cp value
+pruned_tree <- prune(cvtree$finalModel, cp = best_cp$cp)
+
+#plot pruned tree
+#plot(pruned_tree)
+#text(pruned_tree, use.n = TRUE, cex = 0.7)
+
+rpart.plot(
+  pruned_tree,              
+  type = 2,                 
+  extra = 104,             
+  under = TRUE,             
+  box.palette = "GnBu",     
+  fallen.leaves = TRUE,     
+  cex = 0.5,                
+  tweak = 1.2,             
+  compress = TRUE,          
+  varlen = 12,             
+  faclen = 10  
+)
+
+# evaluate pruned model, had to work arround some errors ("Error in eval(predvars, data, env) :    object 'Borough_Of_Incident_OccurrenceBrooklyn' not found.")
+test_data1 <- model.matrix(~ . -1, data = test_data) %>% as.data.frame()
+p.cvtree.pred <- predict(pruned_tree, newdata = test_data1, type = "class")
+confusionMatrix(p.cvtree.pred, as.factor(test_data1$Penalty_Binary), mode = "prec_recall")
+
+```
+
+Though still dense, this pruned model appears the same as my unpruned, cross-validated decision tree. It bears the same major splits on either side, with the left subtree (where victim race is not missing) splitting at victim gender, precinct, and reason for police contact. Minor splits occur along Borough and Officer Race. Where victim race is missing, the right subtree splits at FADO Type (Force as the strongest indicator of discipline), followed by splits at precinct, location of incident occurrence, reason for police contact, and officer rank. 
+
+The confusion matrix output is the same: a precision score of 0.60, a recall of 0.45, and an F1 score of 0.51 show minimal improvement from the first decision tree. As of right now, the model predicts no penalty (0) correctly about 60% of the time, correctly classifies actual 0s only 45% of the time, and misses a significant number of actual 0s with moderate confidence. Even the Kappa remains the same. 
+
+Thus, it appears pruning does not make any significant difference in my classification tree predictions, where cross validation improves the model marginally. 
+
+Let's proceed with the next model, a randomForest. My midterm pilot randomForest showed promising predictive power. 
+
+### randomForest
+
+A random forest uses decision trees as building blocks to construct a more powerful prediction model. Hopefully, my attempt at a random forest will enhance accuracy and robustness, as each tree will be trained on a random subset of the data and consider a random subset of features at each split and averaging out these predictions. Perhaps this model is better suited to capture the complex interactions between victim race, gender, and age, with precinct and reason for police contact. Random forests also provide feature importance scores, which will provide better insight on which features are the most influential in disciplinary outcomes, with stronger predictive value. 
+
+```{r, echo = TRUE}
+
+## using matrix because randomForest() cannot use factors that exceed 53 levels
+
+# accounting for too many factor levels by converting Precinct to numeric
+set.seed(234)
+train_data$Penalty_Binary <- as.factor(train_data$Penalty_Binary) # making sure Penalty_Binary is a factor
+
+# convert Precinct to numeric (too many unique levels)
+train_data$Precinct <- as.numeric(as.factor(train_data$Precinct))
+test_data$Precinct <- as.numeric(as.factor(test_data$Precinct))
+
+train_features <- train_data %>% dplyr::select(c(Borough, Location, PoliceContact, Rank, Victim_Age_Range, Victim_Gender, Victim_Race, Officer_Race, Officer_Gender, Total_Complaints, Precinct, Experience, Penalty_Binary))
+
+test_features <- test_data %>% dplyr::select(c(Borough, Location, PoliceContact, Rank, Victim_Age_Range, Victim_Gender, Victim_Race, Officer_Race, Officer_Gender, Total_Complaints, Precinct, Experience, Penalty_Binary))
+
+
+# training random forest model (not with matrix)
+rf <- randomForest(Penalty_Binary ~., 
+                  data = train_features,
+                  method = "rf", 
+                  trControl = train_control, 
+                  importance = TRUE, 
+                  do.trace = 100)
+
+# print
+print(rf)
+
+# feature importance
+varImpPlot(rf)
+
+# predict on test data
+rf_pred <- predict(rf, newdata = test_features)
+
+# Confusion Matrix
+confusionMatrix(rf_pred, as.factor(test_features$Penalty_Binary), mode = "prec_recall")
+
+```
+
+I found the variable importance plot output by randomForest relatively surprising. The MeanDecreaseAccuracy plot measures how much model accuracy decreases when a variable is excluded, while the MeanDecreaseGini plot measures how each variable contributes to the homogeneity of nodes in the resulting random forest. That said, Reason_for_Police_Contact proved to be the most important in both plots, contradicting our previous models' evaluation of victim race as the most prevalent feature. The MeanDecreaseAccuracy plot presents an officer's total complaints and victim race next most important features, whereas the MeanDecreaseGini plot follows reason for police contact with total complaints and precinct of incident occurrence. Both plots classify officer gender as the least important in determining a disciplinary outcome. 
+
+As for the confusion matrix, the random forest proceeded with a precision score of 0.97, a recall score of 0.85, and an F1 score of 0.91. In other words, when the rf predicts 0, it is correct about 97% of the time, correctly identifying about 85% of actual 0s. This model definitely has the better predictive power compared to the classification tree we parsed through.
+
+## Model Comparison 
+
+Why did the randomForest outperform the classification tree by so wide a margin? What about the data lends itself to a randomForest? The following section includes varying attempts at digging deeper into the gap between tree and forest performance. 
+
+### Matrix Evaluation
+
+To better understand model performance, let's take a look at the confusion matrices of both the single classification tree and the randomForest. For its minor improvements from our first classification tree, I'll be using the pruned tree. 
+
+> Comparing Confusion Matrices
+
+```{r, echo = TRUE}
+
+# comparing confusion matrices
+cat("Classification Tree:\n")
+confusionMatrix(p.cvtree.pred, test_data$Penalty_Binary, mode = "everything")
+
+cat("Random Forest:\n")
+confusionMatrix(rf_pred, test_data$Penalty_Binary, mode = "everything")
+
+```
+
+The classification tree predicts no penalty (0) correctly about 60% of the time, correctly classifies actual 0s only 45% of the time, and misses a significant number of actual 0s with moderate confidence. Its predicted values agree with the actual values only about 25% of the time. 
+
+The randomForest predicts no penalty (0) correctly about 97% of the time, correctly classifying actual 0s about 85% of the time. Its predicted values agree with actual values at a rate of about 85%. 
+
+### Variable Importance 
+
+> Comparing Variable Importance
+
+```{r, echo = TRUE}
+
+# variable importance for rf
+varImpPlot(rf, n.var = 10)
+
+# variable importance for classification tree
+tree_importance <- pruned_tree$variable.importance
+top_10 <- sort(tree_importance, decreasing = TRUE)[1:10]
+barplot(top_10,
+        main = "Top 10 Variable Importances - Classification Tree",
+        col = "skyblue",
+        las = 2,
+        cex.names = 0.8)
+
+```
+
+Variable importance quantifies how much a model relies on a variable to make accurate predictions. The randomForest model calculates variable importance in two ways: with a Mean Decrease Accuracy plot and a Mean Decrease Gini plot. The MeanDecreaseAccuracy plot measures how much model accuracy decreases when a variable is excluded, while the MeanDecreaseGini plot measures how each variable contributes to the homogeneity of nodes in the resulting random forest.
+
+A single classification tree, on the other hand, is highly variable and subject to change based on the arrangement of data in the training sample. As it is built hierarchically, the tree is sensitive to the order in which variables are processed. At each node, the tree selects the single best split, which reduces impurity the most at a given moment, not over the tree in its entirety. The top split determines every split that follows, meaning that once the top split is chosen, the tree will not reconsider any other splits. One misclassified record can thus shift the top split and downstream branches of a single tree. Thus, the top variable importances featured above are subject to change given a rearrangement of the training data. 
+
+The highly variable tree finds importance in Victim Race, Victim Gender, Victim Age, Precinct, and Reason for Police Contact, splitting at various values of each variable. These importances reflect the tree's specific structure, not necessarily broader patterns in the data. A classification tree gives importance = 0 to any variable it didn't use. A variable's absence does not necessarily mean it is unimportant. 
+
+When processing the data, random forests force each split to consider only a subset of the predictors; a good amount of splits will thus occur without accounting for the strongest predictor, giving other predictors a chance--this process is known as random feature selection. As the forest ensembles multiple trees and decorrelates them by considering subsets of predictor for each tree, it makes the average of the resulting trees less variable and hence more reliable. We can approach Reason for Police Contact, Total Officer Complaints, Victim Race, Victim Age, and Precinct as variables with real bearing on disciplinary outcomes, as the randomForest's strong predictive power and aggregatory method provides more reliability than a single tree. 
+
+Note how the important variables of the single classification tree take one value. A single tree splits on Precinct 60, for instance, missing the full regional pattern of disciplinary action for one promising datapoint. In contrast, the random forest model is able to appreciate systematic patterns across variables like Precinct. See the marginal distribution of the partial dependence plot below:
+
+```{r, echo = TRUE}
+
+library(pdp)
+
+# marginal effect of precinct on penalty prediction
+partialPlot(rf, train_features, x.var = "Precinct", which.class = 1)
+
+```
+
+Precincts in the higher ranges (between 60 and 80) have higher average penalty predictions (~0.36+) than those in the lower numbers. A single tree could not capture this pattern in its variable importance plot. 
+
+### Ensembling vs. Random Feature Selection 
+
+> Is the improvement in predictive performance due to ensembling or to random feature sampling?
+
+As we compare variable importances, we must recall that a single classification tree does not measure any average across several iterations of predictions. The tree is a single snapshot! Below is an attempt at Bootstrap Aggregating--also known as bagging--to train multiple full trees on repeated samples from the same training data. Let's see how bagging our classification tree compares to the randomForest model. Strong performance will will indicate that the tree failed for its singularity, not its lack of randomness. 
+
+```{r, echo = TRUE}
+
+# attempting to bag
+
+n_predictors <- ncol(train_data) - 1  # Penalty_Binary is the target
+
+bagged_tree <- randomForest(
+  Penalty_Binary ~ ., 
+  data = train_features, 
+  mtry = n_predictors,     # Use all features at every split (bagging)
+  ntree = 500,             # Number of trees
+  importance = TRUE
+)
+
+# evaluate with confusion matrix
+
+bagged_preds <- predict(bagged_tree, newdata = test_features)
+confusionMatrix(bagged_preds, as.factor(test_features$Penalty_Binary), mode = "everything")
+
+# variable importance plot
+
+varImpPlot(bagged_tree, main = "Variable Importance - Bagged Tree")
+
+
+```
+The bagged tree predicts no penalty (0) correctly about 97% of the time (very few false positives), correctly classifying actual 0s about 89% of the time (high true positive rate). An F1 score of 92% is about 2% higher than that of the randomForest, suggesting that the bagged tree has an even better ability to accurately classify both positive and negative cases by combining precision and recall into a single value. Its predicted values agree with actual values at a rate of about 88%. This outcome is incredibly surprising! The single decision tree was thus limited by high variance. Ensemble averaging--even without random feature selection--significantly stabilizes and improves model quality. Perhaps the data benefits more from variance reduction (bagging) than from decorrelation of predictors (random feature selection). This may also indicate that important features are few and strong, and the random forest adds noise by randomly subsetting the data. 
+
+One must not get too excited about this high performance, however. When bagging a large number of trees, it is no longer possible to represent the resulting statistical learning procedure using a single tree, thus obscuring feature importance. Bagging therefore improves prediction accuracy at the expense of interpretability.
+
+For this reason, I take the variable importance plots of the bagged tree with a grain of salt. Our textbook, An Introduction to Statistical Learning, states the following on bagging decision trees: 
+
+"When building these decision trees, each time a split in a tree is considered, a random sample of m predictors is chosen as split candidates from the full set of p predictors. The split is allowed to use only one of those m predictors. A fresh sample of m predictors is taken at each split...most or all of the trees will use [a] strong predictor in the top split. Consequently, all of the bagged trees will look quite similar to each other. Hence the predictions from the bagged trees will be highly correlated. Unfortunately, averaging many highly correlated quantities does not lead to as large of a reduction in variance as averaging many uncorrelated quantities. In particular, this means that bagging will not lead to a substantial reduction in variance over a single tree in this setting."
+
+The high performance of the bagged tree could be due in part to high correlation. The common importance of reason for police contact, victim race, total officer complaints, precinct, and victim age range in both the bagged tree and the random forest indicate that those features are pivotal in determining whether police officers are disciplined.
+
+In all, the impressive performance of the bagged tree suggests the strong performance of the randomForest model is due in large part to its ensemble averaging, perhaps more than its random feature selection. 
+
+### Case-Based Comparison
+
+Finally, let's use some of the actual data to compare the predictive abilities of the bagged tree and the random forest. 
+
+```{r, echo = TRUE}
+
+
+# 1. Sample 3 random rows from the test set
+set.seed(123)
+example_rows <- test_features[sample(nrow(test_features), 3), ]
+
+# 2. Align factor levels with training set
+for (col in names(train_features)) {
+  if (is.factor(train_features[[col]])) {
+    example_rows[[col]] <- factor(example_rows[[col]], levels = levels(train_features[[col]]))
+  }
+}
+
+# 3. Predict with Random Forest
+rf_classes <- predict(rf, newdata = example_rows)
+rf_probs <- predict(rf, newdata = example_rows, type = "prob")[, "1"]
+
+# 4. Predict with Bagged Tree
+bagged_classes <- predict(bagged_tree, newdata = example_rows)
+bagged_probs <- predict(bagged_tree, newdata = example_rows, type = "prob")[, "1"]
+
+# 5. Combine into a comparison table
+comparison <- data.frame(
+  Actual = example_rows$Penalty_Binary,
+  RF_Pred = rf_classes,
+  RF_Prob_1 = round(rf_probs, 3),
+  Bagged_Pred = bagged_classes,
+  Bagged_Prob_1 = round(bagged_probs, 3)
+)
+
+print(comparison)
+
+```
+
+Based on the comparison table, it appears both the random forest and the bagged tree correctly predict a penalty (1) with high confidence for the first random entry. The bagged tree is more confident than the random forest. For the second random entry, both models predicted penalty (1), though the actual outcome resulted in no penalty (0). With moderate confidence from both models, one can assume this case was pretty ambiguous. For the third and final random entry, both models correctly predicted no penalty (0) with high confidence, suggesting that the features of this case in tandem were clearly indicative that there would be no disciplinary action. Perhaps the complainant was of a race with a corresponding low likelihood of disciplinary action for police perpetrators of misconduct. 
