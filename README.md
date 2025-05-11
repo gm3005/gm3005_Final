@@ -1,2 +1,6 @@
 # gm3005_Final
 This is a final project for the completion of Applied Machine Learning (Spring 2025) at Columbia University
+
+"Predicting Disciplinary Action for Complaints against NYPD Officers" is an exercise in using various tree/forest methods to predict penalties against NYPD officers who have committed alleged misconduct, between 2015 and 2025. The project's aim is to conduct a comprehensive analysis robust enough to advise victims of police wrongdoing on the likelihood of receiving justice, should they choose to file a complaint with the CCRB. I do so using a classification tree and a random forest as my predictive models, assessing their relative performances as they relate to ensemble averaging and random feature selection. Ultimately, I incorporate a bagged tree to measure against the promising predictive power of the random forest model. Three respective R folders contain the following sections of code: "data_ingestion" includes merging, cleaning, and subsetting the data from the CCRB; "feature_gen_viz" includes feature engineering and exploratory visualizations; "model_comparison" includes experimentation with model selection, as well as comparison between classification tree, bagged tree, and random forest models. 
+
+Note: viewers must source the environment/variables from the full project file.
