@@ -1,0 +1,150 @@
+---
+title: "featuregen_algo"
+author: "Gabriella Montalvo"
+date: "2025-05-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(caret)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(jsonlite)
+library(ggrepel)
+library(MASS)
+library(lubridate)
+library(rpart)
+library(glmnet)
+library(randomForest)
+library(zoo)
+library(rpart.plot)
+```
+
+# Final Project: Predicting Disciplinary Action for Complaints against NYPD Officers
+### Analyzing Differences Between Model Performances in Disciplinary Action Prediction
+## Feature Generation and Exploratory Analysis Visualizations
+
+The following code includes some feature engineering and exploratory data analysis on my dataframe ccrb, which compiles 4 datasets from the Civilian Complaint Review Board (complaints, allegations, penalties, and officers) to provide indicators and targets for measuring disciplinary action against NYPD officers accused of misconduct. 
+
+With an end goal of predicting disciplinary action for complaints against NYPD officers, my more immediate aim is to engineer a target variable that is readable and accessible for my presumed audience--those interested in filing a claim against the NYPD through the CCRB. Considering my audience may just be getting acquainted with the system and its patterns of punishment, I'm including some relatively plain visualizations to get more comfortable with the data. 
+
+# Step 1: Feature Engineering
+
+> Encoding Binary Target Variable
+
+```{r, echo = TRUE}
+
+# checking levels of officer penalties; a lot of different variety (many levels to category, could be problematic)
+unique(ccrb$NYPD_Officer_Penalty)
+
+# setting variable to factor
+ccrb$NYPD_Officer_Penalty <- as.factor(ccrb$NYPD_Officer_Penalty)
+
+# creating target binary variable, in case many levels of categorical response are too unwieldy
+ccrb$Penalty_Binary <- ifelse(ccrb$NYPD_Officer_Penalty == "No penalty", 0, 1)
+
+# updating dataframe so target variable is only the binary Penalty_Binary variable
+#ccrb <- subset(ccrb, select = -NYPD_Officer_Penalty)
+
+
+# categorizing officer years of experience for readability (instead of days on workforce)
+ccrb$Officer_Experience_Bin <- cut(ccrb$Officer_Days_On_Force_At_Incident, 
+                                  breaks = c(0, 365, 1825, 3650, Inf), 
+                                  labels = c("0-1yr", "1-5yrs", "5-10yrs", "10+yrs"))
+
+# colSums(is.na(ccrb)) ; some missing data in experience bins 
+ccrb$Officer_Experience_Bin <- na.locf(ccrb$Officer_Experience_Bin) # using neighboring values to fill in blanks
+
+```
+
+NYPD_Officer_Penalty has 109 unique levels. These levels, though valuable in an ultimate assessment of the chances and severity of discipline, would be better analyzed in future iterations of this project. For now, we will use the binary option as the target for our variables. A score of 0 means that no penalty was placed on the officer in question, while a score of 1 means that there was. 
+
+## Step 2: Exploratory data analysis/visualization
+
+> Converting columns to factors for visualization
+
+```{r, echo = TRUE}
+
+# convert all character strings to factors
+ccrb[sapply(ccrb, is.character)] <- lapply(ccrb[sapply(ccrb, is.character)], 
+                                       as.factor)
+
+ccrb$Penalty_Binary <- as.factor(ccrb$Penalty_Binary)
+
+```
+
+> Visualization 
+
+```{r, echo = TRUE}
+
+# 1. Distribution of Penalty_Binary
+ggplot(ccrb, aes(x = Penalty_Binary, fill = Penalty_Binary)) +
+  geom_bar() +
+  labs(title = "Distribution of Penalty Binary", x = "Penalty (1 = Yes, 0 = No)", y = "Count") +
+  theme_minimal()
+
+# 2. FADO Type vs. Penalty
+ggplot(ccrb, aes(x = FADO_Type, fill = Penalty_Binary)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  labs(title = "Proportion of Complaints Leading to Penalty by FADO Type", x = "FADO Type", y = "Proportion") +
+  theme_minimal()
+
+# 3. Officer Race and Gender vs. Penalty
+ggplot(ccrb, aes(x = Officer_Race, fill = Penalty_Binary)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  labs(title = "Proportion of Officers Receiving Penalties by Race", x = "Officer Race", y = "Proportion") +
+  theme_minimal()
+
+ggplot(ccrb, aes(x = Officer_Gender, fill = Penalty_Binary)) +
+  geom_bar(position = "fill") +
+  labs(title = "Proportion of Officers Receiving Penalties by Gender", x = "Officer Gender", y = "Proportion") +
+  theme_minimal()
+
+# 4. Office Years of Experience vs. Penalty
+ggplot(ccrb, aes(x = Officer_Experience_Bin, fill = Penalty_Binary)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  labs(title = "Proportion of Officers Receiving Penalties by Years of Experience", x = "Officer Race", y = "Proportion") +
+  theme_minimal()
+
+# 5. Boroughs vs. Penalty
+ggplot(ccrb, aes(x = Borough_Of_Incident_Occurrence, fill = Penalty_Binary)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  labs(title = "Proportion of Complaints Leading to Penalty by Borough", x = "Borough", y = "Proportion") +
+  theme_minimal()
+
+# 6. Distribution of NYPD_Officer_Penalty
+top_penalties <- ccrb %>%
+  count(NYPD_Officer_Penalty, sort = TRUE) %>%
+  top_n(10, n)
+
+# 7. Plot the top 10 penalties
+ggplot(top_penalties, aes(x = reorder(NYPD_Officer_Penalty, n), y = n, fill = NYPD_Officer_Penalty)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Top 10 NYPD Officer Penalties", x = "Penalty Type", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+
+Plot 1: Loosely, it appears as though complaints result in more penalties than not. That said, this histogram does not distinguish between levels of discipline (redacting vacation days vs. removal from NYPD. 
+
+Plot 2: FADO (Force, Abuse of Authority, Discourtesy, and Offensive Language) is how the CCRB categorizes allegations filed against the NYPD. Complaints citing use of force result in penalty the least at a proportional rate of under 55%. Abuse of authority appears to fall just under 60%, with Untruthful Statement at a bit above 60%. Offensive language appears to result in discipline the most, at a rate of about .65. 
+
+Plot 3 (Race): Complaints against indigenous officers appear to result in penalty the least (less than 30%). It is worth noting that the indigenous population in New York City is smaller than that of Black, Hispanic, Asian, and White communities in NYC. Asian and Hispanic appear to fall along the same proportional rate, with about 60% of complaints resulting in discipline. Black and White officers fall around the same rate, both with over 60% of complaints resulting in discipline. 
+
+Plot 3 (Gender): Trans and Gender Non-Conforming officers appear to receive more penalties proportionally than male- and female-identified officers. That said, we can assume the population of TGNC officers to be much smaller than that of male or female officers. Complaints filed against female officers result in disciplinary action the least, at a proportional rate of about 55%. Complaints filed against male officers result in disciplinary action at a higher proportion, about 60%. 
+
+Plot 4: It appears more penalties are levied against more senior officers. I am quantifying seniority as 5+ years of experience on the force, with 5-10 years and 10+ years of experience have similar rates of penalty. Where officers of 1-5 years of experience tend to receive penalty at a rate above 50% (but still less than "senior" officers at about 60%), new officers with less than one year of experience receive penalties at a less than 50% rate. 
+
+Plot 5: It appears complaints filed outside the metropolitan area are more likely to result in disciplinary action, proportionally. Complaints filed in Staten Island, Queens, Manhattan, and Brooklyn appear to hover just under a 60% penalty rate. The Bronx, however, appears to have the lowest proportion of complaints leading to penalty (likely just under 55%). 
+
+Plot 6: As seen in the Top 10 NYPD Officer Penalties bar chart, officers with allegations/complaints of misconduct most often receive no penalty, followed (with large distance) by a pending decision from the Administrative Prosecution Unit, which is involved with more serious NYPD offenses. A pending decision (as of the week of March 9, 2025) suggests that there is a great deal of stagnation in the officer disciplinary process. Formalized training follows closely behind; it entails a mandatory review of NYPD standards similar to HR instruction. 
